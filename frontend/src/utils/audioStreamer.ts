@@ -52,9 +52,16 @@ export class AudioStreamer {
   private micQueuedBytes: number = 0;
   private micFlushBytes: number = 6400; // ~200ms @ 16kHz 16-bit mono
   private micFlushTimer: number | null = null;
+  private primed: boolean = false;
+  private primeBytes: number = 1600; // ~50ms: first byte out fast, then normal rules
   private nativeRate: number = MIC_TARGET_RATE;
   private chunksSent: number = 0;
   private bytesSent: number = 0;
+  // Voice-input timing (performance.now ms, reset per recording).
+  private recStartAt: number = 0;
+  private firstFrameAt: number = 0;
+  private firstFlushAt: number = 0;
+  private lastFlushAt: number = 0;
 
   constructor(
     onAudioChunk: (base64Pcm: string) => void,
@@ -121,15 +128,35 @@ export class AudioStreamer {
 
   /**
    * Queues raw mic bytes, flushing ~200ms frames to the server.
+   * The very first frame of each recording is primed out early (~50ms of
+   * audio) so Gemini gets its first byte fast; steady state is unchanged.
    */
   private queueMicBytes(data: ArrayBuffer): void {
     if (!this.isCapturing) return;
+    if (!this.firstFrameAt) this.firstFrameAt = performance.now();
     const chunk = new Uint8Array(data.slice(0));
     this.micQueue.push(chunk);
     this.micQueuedBytes += chunk.byteLength;
     if (this.micQueuedBytes >= this.micFlushBytes) {
       this.flushMicQueue();
+    } else if (!this.primed && this.micQueuedBytes >= this.primeBytes) {
+      this.primed = true;
+      this.flushMicQueue();
     }
+  }
+
+  /**
+   * Per-recording capture timeline (all performance.now ms, 0 = not yet).
+   * recStart: recording started; firstFrame: first mic quantum arrived;
+   * firstFlush/lastFlush: first/last WS chunk sent.
+   */
+  getMicTimings(): { recStart: number; firstFrame: number; firstFlush: number; lastFlush: number } {
+    return {
+      recStart: this.recStartAt,
+      firstFrame: this.firstFrameAt,
+      firstFlush: this.firstFlushAt,
+      lastFlush: this.lastFlushAt,
+    };
   }
 
   private flushMicQueue(): void {
@@ -150,16 +177,19 @@ export class AudioStreamer {
     }
     this.chunksSent += 1;
     this.bytesSent += combined.length;
+    const now = performance.now();
+    if (!this.firstFlushAt) this.firstFlushAt = now;
+    this.lastFlushAt = now;
     this.onAudioChunk(btoa(binary));
   }
 
   private startMicFlushTimer(): void {
     this.stopMicFlushTimer();
-    // Time-based flush: ship partial tails every 150ms so pauses don't cut
+    // Time-based flush: ship partial tails every 100ms so pauses don't cut
     // the last syllable (server VAD would fire on truncated audio).
     this.micFlushTimer = window.setInterval(() => {
       if (this.isCapturing) this.flushMicQueue();
-    }, 150);
+    }, 100);
   }
 
   private stopMicFlushTimer(): void {
@@ -199,6 +229,12 @@ export class AudioStreamer {
       this.nativeRate = this.recordContext.sampleRate || 48000;
       this.inputSource = this.recordContext.createMediaStreamSource(this.mediaStream);
       this.isCapturing = true;
+      // Reset per-recording voice timeline + first-byte prime.
+      this.recStartAt = performance.now();
+      this.firstFrameAt = 0;
+      this.firstFlushAt = 0;
+      this.lastFlushAt = 0;
+      this.primed = false;
       this.startMicFlushTimer();
 
       // Attempt to use modern AudioWorklet first
@@ -339,9 +375,11 @@ export class AudioStreamer {
   }
 
   /**
-   * Plays a 24kHz 16-bit linear PCM audio chunk received from Gemini Live
+   * Plays a 24kHz 16-bit linear PCM audio chunk received from Gemini Live.
+   * Schedules immediately with only gapless-chaining delay. Returns the
+   * estimated milliseconds until this chunk becomes audible (0 = now).
    */
-  playAudioChunk(base64Data: string): void {
+  playAudioChunk(base64Data: string): number {
     const ctx = this.getAudioContext();
 
     // Decode base64 to binary
@@ -374,6 +412,8 @@ export class AudioStreamer {
     }
 
     source.start(this.scheduledTime);
+    // Audible delay = gapless queue backlog only (no extra buffering).
+    const msUntilAudible = Math.max(0, (this.scheduledTime - currentTime) * 1000);
     this.scheduledTime += audioBuffer.duration;
     this.activeSources.push(source);
 
@@ -390,6 +430,8 @@ export class AudioStreamer {
         this.onSpeakingStateChange(false);
       }
     };
+
+    return msUntilAudible;
   }
 
   /**

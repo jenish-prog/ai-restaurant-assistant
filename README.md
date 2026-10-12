@@ -61,3 +61,33 @@ npm install
 npm run dev
 ```
 - Dashboard URL: `http://127.0.0.1:5173`
+
+---
+
+## 📞 Real Phone Calls (Twilio + Gemini Live)
+
+When a customer dials your Twilio restaurant number, this flow runs:
+
+1. **Customer calls** the Twilio number (normal mobile/landline call).
+2. **Twilio** `POST`s to `/api/voice/incoming` → backend answers with TwiML `<Stream>` → live 8kHz mu-law audio flows over `/api/voice/twilio-stream`.
+3. **AI backend** (`TwilioCallBridge` + shared `GeminiLiveSession`) transcodes audio both ways and runs the same menu/ordering tools as the dashboard voice tester.
+4. **AI speaks**: greets once, takes the order, reads back items + total, waits for explicit confirmation (barge-in supported via `clear` events).
+5. **Restaurant gets the order**: saved to SQLite (appears live on the dashboard) + one call record with transcript; WhatsApp receipt attempted if `WHATSAPP_*` keys are set.
+
+### Setup
+```bash
+# 1. Expose your backend publicly (Twilio cannot reach 127.0.0.1)
+ngrok http 8000   # note the https URL, e.g. https://abc123.ngrok.io
+
+# 2. backend/.env — fill Twilio credentials (Twilio Console)
+TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxx
+TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxx
+TWILIO_PHONE_NUMBER=+19876543210
+# Optional override (defaults to wss://<public-host>/api/voice/twilio-stream):
+# TWILIO_STREAM_URL=wss://abc123.ngrok.io/api/voice/twilio-stream
+
+# 3. Restart backend, then in Twilio Console > Phone Numbers > your number:
+#    Voice webhook (POST): https://abc123.ngrok.io/api/voice/incoming
+```
+- Test by calling the Twilio number from your own phone. Watch backend logs for `Incoming call`, `Twilio call started`, greeting, `recv->first_audio`, and the saved order.
+- Browser voice tester (`/api/voice-simulator/stream`) is unchanged — same brain, two doorways.

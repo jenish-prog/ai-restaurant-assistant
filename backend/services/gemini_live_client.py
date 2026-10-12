@@ -49,7 +49,7 @@ CORE PRINCIPLES & INSTRUCTIONS:
 
 4. MANDATORY TOOL INVOCATION FOR ORDERS:
    - Whenever the caller requests food or items (e.g., "I want two chicken biryanis", "add a butter chicken"), YOU MUST ALWAYS CALL `create_order_draft` with the items immediately in the same turn. Do not merely verbally acknowledge; ALWAYS invoke `create_order_draft` so the backend computes the official price and 5% GST.
-   - When `create_order_draft` returns the result, read back the itemized items, the 5% GST, and the grand total in Rupees (₹) to the customer, and ask for their confirmation.
+   - When `create_order_draft` returns the result, read back ONLY items with quantities and the grand total in Rupees (₹), then ask for confirmation.
    - If the caller changes the quantity or adds/removes items (e.g. "make that three chicken biryanis instead"), immediately call `create_order_draft` again with the new list of items, read the updated total, and ask for confirmation again.
 
 5. MANDATORY EXPLICIT CONFIRMATION BEFORE PLACING ORDER:
@@ -57,9 +57,11 @@ CORE PRINCIPLES & INSTRUCTIONS:
    - Under no circumstances should an order be marked placed without calling `confirm_order` and receiving a success response.
    - Once `confirm_order` returns status "success" with an order ID (e.g., ORD-106), tell the caller their order number and estimated preparation time.
 
-6. AVOID ROBOTIC REPETITION:
-   - Speak naturally like a warm, high-end restaurant host. Keep spoken responses concise (1 to 3 sentences maximum) suitable for phone voice playback.
-   - Do not repeat the same greeting or fixed phrases over and over. Respond directly and contextually to what the caller actually says.
+6. CONCISE, PHONE-FAST REPLIES (1-2 SENTENCES):
+   - Answer in 1-2 short sentences. No filler, no introductions after the greeting, no narrating tools or processing.
+   - Menu question: one-line summary from live tool data ("We have biryani, fried rice, dosa, and starters — what would you like?"), details only when asked.
+   - One clarification question at a time; never repeat the welcome message.
+   - Ordering read-back is essentials only: dish names with quantities + grand total + "Shall I confirm?" Skip subtotal/GST narration unless the caller asks.
 
 7. LISTEN CAREFULLY & STAY ON TOPIC (PHONE-CALL ACCURACY):
    - Listen to the CURRENT user turn only. Never answer a previous question again.
@@ -68,7 +70,8 @@ CORE PRINCIPLES & INSTRUCTIONS:
    - One question at a time. After placing an order, ask "Anything else?" and wait for the reply.
 
 8. PHONE-CALL SPEED:
-   - Reply immediately in under 2 sentences whenever possible. No filler, no long introductions after the first greeting.
+   - Start answering as soon as you can; never wait to "say more".
+   - Accuracy and explicit order confirmation always outrank speed.
 """
 
 TOOLS_SCHEMA = [{
@@ -197,7 +200,8 @@ class GeminiLiveSession:
         self._audio_buffer = bytearray()
         self._audio_lock = asyncio.Lock()
         self._flush_bytes = 6400  # 200ms @ 16kHz 16-bit mono
-        self._min_partial_bytes = 1280  # 40ms — periodic flusher floor
+        self._min_partial_bytes = 960  # 30ms — periodic flusher floor
+        self._flush_interval = 0.08  # 80ms tail flush
         # Diagnostics counters (no audio content, no secrets).
         self.stats: Dict[str, int] = {
             "audio_frames_in": 0,
@@ -211,6 +215,75 @@ class GeminiLiveSession:
             "interrupts": 0,
             "tool_calls": 0,
         }
+        # Per-turn latency marks (perf_counter seconds, keyed by cid).
+        # t_recv = backend received final input; t_first_event/t_first_audio =
+        # first Gemini response/audio for that turn. No text/audio logged.
+        self._turn_marks: Dict[str, Dict[str, float]] = {}
+        self._active_cid: Optional[str] = None
+
+    def mark_turn_received(self, cid: Optional[str], kind: str = "text"):
+        """t1: backend received the finalized turn (text msg or audio_end)."""
+        import time as _time
+        if not cid:
+            return
+        now = _time.perf_counter()
+        marks: Dict[str, float] = {"t_recv": now, "kind": kind}
+        if kind == "voice":
+            # First audio byte arrived BEFORE audio_end: carry it over so the
+            # voice timeline starts at first byte, not at the end signal.
+            pending = self._turn_marks.pop("__voice_audio", None)
+            if pending and "t_first" in pending:
+                marks["t_audio_first_rx"] = pending["t_first"]
+                dt = (now - pending["t_first"]) * 1000
+                logger.info(f"VOICE cid={cid} first_byte->end_signal={dt:.0f}ms")
+        self._turn_marks[cid] = marks
+        self._active_cid = cid
+
+    def note_voice_audio_rx(self):
+        """Stamps first audio byte of the in-progress utterance (pre-end-signal)."""
+        import time as _time
+        e = self._turn_marks.setdefault("__voice_audio", {})
+        if "t_first" not in e:
+            e["t_first"] = _time.perf_counter()
+
+    async def note_input_transcription(self):
+        """Partial (first text) vs final (last text before turn end) timing."""
+        import time as _time
+        now = _time.perf_counter()
+        key = self._active_cid or "__voice_stream"
+        m = self._turn_marks.setdefault(key, {})
+        if "t_first_in_tx" not in m:
+            m["t_first_in_tx"] = now
+            base = m.get("t_recv")
+            suffix = f" (+{(now - base) * 1000:.0f}ms after recv)" if base else " (streaming, no end signal yet)"
+            logger.info(f"VOICE partial transcription first text cid={key}{suffix}")
+        m["t_last_in_tx"] = now
+
+    async def _mark_response_event(self, is_audio: bool):
+        """t2/t3: first Gemini response event / first audio for active turn."""
+        import time as _time
+        cid = self._active_cid
+        if not cid:
+            return
+        marks = self._turn_marks.get(cid)
+        if not marks:
+            return
+        now = _time.perf_counter()
+        if "t_first_event" not in marks:
+            marks["t_first_event"] = now
+            dt = (now - marks["t_recv"]) * 1000
+            logger.info(f"TURN cid={cid} kind={marks.get('kind')} recv->first_event={dt:.0f}ms")
+        if is_audio and "t_first_audio" not in marks:
+            marks["t_first_audio"] = now
+            dt = (now - marks["t_recv"]) * 1000
+            dev = (now - marks["t_first_event"]) * 1000 if "t_first_event" in marks else 0
+            logger.info(f"TURN cid={cid} kind={marks.get('kind')} recv->first_audio={dt:.0f}ms (event->audio={dev:.0f}ms)")
+            await self._emit_diag("turn_latency", {
+                "cid": cid,
+                "kind": marks.get("kind"),
+                "ms_recv_to_event": round((marks["t_first_event"] - marks["t_recv"]) * 1000),
+                "ms_recv_to_audio": round(dt),
+            })
 
     async def _emit_diag(self, event: str, extra: Optional[Dict[str, Any]] = None):
         payload: Dict[str, Any] = {"type": "diag", "event": event, "stats": dict(self.stats)}
@@ -251,7 +324,9 @@ class GeminiLiveSession:
                     start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
                     end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
                     prefix_padding_ms=100,
-                    silence_duration_ms=400,
+                    # 350ms: fast turn-taking while tolerating natural Tamil/
+                    # English/Tanglish pauses (measured tradeoff; see TURN logs).
+                    silence_duration_ms=350,
                 ),
                 activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
             ),
@@ -320,6 +395,7 @@ class GeminiLiveSession:
 
         self.stats["audio_frames_in"] += 1
         self.stats["audio_bytes_in"] += len(pcm16k_bytes)
+        self.note_voice_audio_rx()
         async with self._audio_lock:
             self._audio_buffer.extend(pcm16k_bytes)
             if len(self._audio_buffer) < self._flush_bytes:
@@ -340,14 +416,14 @@ class GeminiLiveSession:
             logger.error(f"Error streaming audio to Gemini Live: {e}")
 
     async def _periodic_flush_loop(self):
-        """Flushes partial mic tails every 120ms so pauses don't truncate words.
+        """Flushes partial mic tails every 80ms so pauses don't truncate words.
 
         Without this, audio below _flush_bytes sits buffered while server VAD
         already fires → truncated transcription ("heard another question").
         """
         try:
             while self.is_active:
-                await asyncio.sleep(0.12)
+                await asyncio.sleep(self._flush_interval)
                 if not self.is_active or not self.session:
                     break
                 async with self._audio_lock:
@@ -401,6 +477,7 @@ class GeminiLiveSession:
         tag = f" cid={cid}" if cid else ""
         logger.info(f"Gemini input: text turn ({len(text)} chars){tag}.")
         try:
+            self.mark_turn_received(cid, kind="text")
             await self.session.send_client_content(
                 turns={"role": "user", "parts": [{"text": text}]},
                 turn_complete=True,
@@ -487,6 +564,7 @@ class GeminiLiveSession:
 
     async def _handle_server_message(self, response):
         """Handles one LiveServerMessage: audio, transcripts, tools, turn end."""
+        await self._mark_response_event(is_audio=False)
         server_content = response.server_content
 
         if server_content:
@@ -512,6 +590,7 @@ class GeminiLiveSession:
                 if tx:
                     self.stats["input_transcripts"] += 1
                     self.transcript_history.append(("customer", tx))
+                    await self.note_input_transcription()
                     await self._emit_diag("input_transcript")
                     await self._invoke_cb(self.on_transcript, "customer", tx)
 
@@ -519,8 +598,10 @@ class GeminiLiveSession:
             if server_content.model_turn:
                 for part in server_content.model_turn.parts:
                     if part.inline_data and part.inline_data.data:
-                        # 24kHz PCM audio from Gemini
+                        # 24kHz PCM audio from Gemini — forward immediately,
+                        # never buffered: first audible byte matters most.
                         self.stats["audio_chunks_out"] += 1
+                        await self._mark_response_event(is_audio=True)
                         await self._invoke_cb(self.on_audio_out, part.inline_data.data)
 
                     if part.text and not part.text.startswith("**Crafting"):
@@ -532,6 +613,25 @@ class GeminiLiveSession:
 
             if server_content.turn_complete:
                 self.stats["turn_completes"] += 1
+                import time as _time
+                cid = self._active_cid
+                vkey = cid if (cid and cid in self._turn_marks) else "__voice_stream"
+                vm = self._turn_marks.get(vkey, {})
+                if cid and cid in self._turn_marks:
+                    dt = (_time.perf_counter() - self._turn_marks[cid]["t_recv"]) * 1000
+                    logger.info(f"TURN cid={cid} recv->turn_complete={dt:.0f}ms")
+                if "t_first_in_tx" in vm and "t_last_in_tx" in vm:
+                    f = (vm["t_last_in_tx"] - vm["t_first_in_tx"]) * 1000
+                    base = vm.get("t_recv")
+                    anchor = f" (after recv: first=+{(vm['t_first_in_tx'] - base) * 1000:.0f}ms)" if base else " (hands-free stream)"
+                    logger.info(f"VOICE cid={vkey} partial->final transcription={f:.0f}ms{anchor}")
+                if vkey == "__voice_stream":
+                    self._turn_marks.pop("__voice_stream", None)
+                self._active_cid = None
+                # Bound memory: keep only recent turn marks.
+                if len(self._turn_marks) > 20:
+                    for old in list(self._turn_marks)[:-20]:
+                        del self._turn_marks[old]
                 logger.info("Gemini Live: turn_complete.")
                 await self._emit_diag("turn_complete")
                 await self._invoke_cb(self.on_turn_complete)
@@ -546,12 +646,15 @@ class GeminiLiveSession:
                 call_id = call.id
                 logger.info(f"Gemini requested tool call '{name}' with args {args}")
 
+                import time as _ttime
+                _tool_start = _ttime.perf_counter()
                 res = await self._execute_tool(name, args)
+                _tool_ms = (_ttime.perf_counter() - _tool_start) * 1000
 
                 # Notify callback so frontend UI sees real-time tool execution
                 self.stats["tool_calls"] += 1
-                logger.info(f"Tool '{name}' -> {str(res)[:200]}")
-                await self._emit_diag("tool_call", {"name": name})
+                logger.info(f"Tool '{name}' took={_tool_ms:.1f}ms -> {str(res)[:200]}")
+                await self._emit_diag("tool_call", {"name": name, "ms": round(_tool_ms, 1)})
                 await self._invoke_cb(self.on_tool_call, name, args, res)
 
                 function_responses.append(

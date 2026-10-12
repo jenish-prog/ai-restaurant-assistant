@@ -19,17 +19,22 @@ def get_live_menu(category: Optional[str] = None) -> Dict[str, Any]:
     """
     Retrieves live menu items from SQLite database.
     Re-checks prices and kitchen availability.
+    Payload is compact (trimmed descriptions) to keep tool round-trips fast;
+    the dashboard UI uses /api/menu (full rows) separately.
     """
     items = get_all_menu_items(category)
     available_items = []
     unavailable_items = []
 
     for item in items:
+        desc = item["description"] or ""
+        if len(desc) > 80:
+            desc = desc[:77] + "..."
         entry = {
             "id": item["id"],
             "name": item["name"],
             "category": item["category"],
-            "description": item["description"],
+            "description": desc,
             "price_inr": item["price"],
             "prep_time_mins": item["prep_time_mins"],
             "is_available": item["is_available"]
@@ -54,12 +59,17 @@ def normalize_token(w: str) -> str:
         return w[:-1]
     return w
 
-def find_menu_item_match(query: str, available_only: bool = True) -> Optional[Dict[str, Any]]:
+def find_menu_item_match(
+    query: str,
+    available_only: bool = True,
+    db_items: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
     """
     Fuzzy / case-insensitive search to match caller's spoken item name with database items.
     Handles plurals (biryanis -> biryani, risottos -> risotto) and partial mentions.
+    Accepts a pre-fetched item list to avoid repeat DB queries in hot paths.
     """
-    items = get_all_menu_items()
+    items = db_items if db_items is not None else get_all_menu_items()
     clean_query = query.lower().strip()
 
     # Exact or substring match
@@ -98,9 +108,11 @@ def create_or_update_order_draft(
     Validates items against active menu in DB, enforces live INR prices,
     computes 5% GST and delivery fee, and creates/updates a draft.
     Does NOT save to permanent database until caller explicitly confirms.
+    Single DB fetch: menu is read once and reused for validation + matching.
     """
-    all_db_items = {item["id"]: item for item in get_all_menu_items()}
-    all_db_items_by_name = {item["name"].lower(): item for item in get_all_menu_items()}
+    all_db_items_list = get_all_menu_items()
+    all_db_items = {item["id"]: item for item in all_db_items_list}
+    all_db_items_by_name = {item["name"].lower(): item for item in all_db_items_list}
 
     validated_items = []
     rejected_items = []
@@ -132,7 +144,7 @@ def create_or_update_order_draft(
             if raw_name.lower() in all_db_items_by_name:
                 db_item = all_db_items_by_name[raw_name.lower()]
             else:
-                db_item = find_menu_item_match(raw_name, available_only=False)
+                db_item = find_menu_item_match(raw_name, available_only=False, db_items=all_db_items_list)
 
         if not db_item:
             rejected_items.append({
@@ -194,13 +206,12 @@ def create_or_update_order_draft(
 
     active_drafts[new_draft_id] = draft_data
 
-    # Human-readable read-back string for the AI voice agent to read out
+    # Human-readable read-back string for the AI voice agent to read out.
+    # Essentials only (items + grand total) to keep spoken replies short;
+    # full subtotal/GST/delivery breakdown stays in the numeric fields.
     items_summary_en = ", ".join([f"{i['quantity']}x {i['name']} (₹{i['item_total']:.0f})" for i in validated_items])
     read_back_en = (
-        f"Order draft for {order_type}: {items_summary_en}. "
-        f"Subtotal is ₹{subtotal:.0f}, 5% GST is ₹{tax:.0f}"
-        + (f", delivery fee is ₹{delivery_fee:.0f}" if delivery_fee > 0 else "")
-        + f". The grand total is ₹{total:.0f}. "
+        f"{items_summary_en}. The grand total is ₹{total:.0f}. "
         "Shall I confirm and place this order for you?"
     )
 

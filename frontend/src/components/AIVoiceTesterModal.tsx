@@ -89,9 +89,16 @@ export const AIVoiceTesterModal: React.FC<Props> = ({
     tools?: number;
     chunksSent?: number;
     nativeRate?: number;
+    latAudioMs?: number;
+    latTotalMs?: number;
+    backendAudioMs?: number;
   }>({});
   // One turn in flight at a time: cid traces submit→WS→backend→Gemini→reply.
   const pendingCidRef = useRef<string | null>(null);
+  // t0/t1 per turn (performance.now ms): submit/stop time + kind for latency math.
+  const turnTimingRef = useRef<{ cid: string; tSubmit: number; kind: string; firstAudioAt?: number } | null>(null);
+  // Raw audio-chunk count (ref, no renders); synced to diag throttled + on turn end.
+  const audioCountRef = useRef(0);
   const watchdogRef = useRef<number | null>(null);
   const micStateRef = useRef<MicState>('idle');
   useEffect(() => {
@@ -227,6 +234,9 @@ export const AIVoiceTesterModal: React.FC<Props> = ({
           if (data.event && data.event !== 'audio_out') {
             console.info(`[voice] diag: ${data.event}`, s);
           }
+          if (data.event === 'turn_latency' && typeof data.ms_recv_to_audio === 'number') {
+            setDiag((prev) => ({ ...prev, backendAudioMs: data.ms_recv_to_audio }));
+          }
           if (
             data.event === 'session_error' ||
             data.event === 'session_closed_unexpectedly' ||
@@ -267,10 +277,29 @@ export const AIVoiceTesterModal: React.FC<Props> = ({
             setMicState('error');
           }
         } else if (data.type === 'audio') {
-          // Received 24kHz PCM chunk from Gemini Live
-          setDiag((prev) => ({ ...prev, audioOut: (prev.audioOut ?? 0) + 1 }));
+          // Received 24kHz PCM chunk from Gemini Live — play immediately.
+          // Counter-only state is throttled (every 5th chunk) so playback at
+          // ~5 chunks/sec doesn't re-render the modal on every chunk; the
+          // exact count syncs on turn_complete. Audio itself is never delayed.
+          audioCountRef.current += 1;
+          if (audioCountRef.current % 5 === 0) {
+            const n = audioCountRef.current;
+            setDiag((prev) => ({ ...prev, audioOut: n }));
+          }
+          let msUntilAudible = 0;
           if (streamerRef.current && !mutedRef.current) {
-            streamerRef.current.playAudioChunk(data.data);
+            msUntilAudible = streamerRef.current.playAudioChunk(data.data);
+          }
+          const timing = turnTimingRef.current;
+          if (timing && timing.firstAudioAt === undefined && pendingCidRef.current === timing.cid) {
+            timing.firstAudioAt = performance.now();
+            const msSubmitToAudio = Math.round(timing.firstAudioAt - timing.tSubmit);
+            console.info(
+              `[voice] TURN cid=${timing.cid} kind=${timing.kind} ` +
+              `submit->first_audio=${msSubmitToAudio}ms ` +
+              `playback_queue=${Math.round(msUntilAudible)}ms`
+            );
+            setDiag((prev) => ({ ...prev, latAudioMs: msSubmitToAudio }));
           }
         } else if (data.type === 'interrupted') {
           // Gemini detected interruption -> stop playing immediately
@@ -287,7 +316,16 @@ export const AIVoiceTesterModal: React.FC<Props> = ({
           clearWatchdog();
           turnRef.current += 1;
           const turnAtComplete = turnRef.current;
+          const audioTotal = audioCountRef.current;
           if (streamerRef.current && !streamerRef.current.isPlaying()) {
+            const timing = turnTimingRef.current;
+            if (timing?.firstAudioAt !== undefined) {
+              const msTotal = Math.round(performance.now() - timing.tSubmit);
+              console.info(`[voice] TURN cid=${timing.cid} submit->done=${msTotal}ms`);
+              setDiag((prev) => ({ ...prev, latTotalMs: msTotal, audioOut: audioTotal }));
+            } else {
+              setDiag((prev) => ({ ...prev, audioOut: audioTotal }));
+            }
             setMicState(streamerRef.current.isCapturingAudio() ? 'listening' : 'idle');
           } else {
             // Audio still queued: fall back to idle/listening when playback drains.
@@ -295,6 +333,14 @@ export const AIVoiceTesterModal: React.FC<Props> = ({
               if (!streamerRef.current || !streamerRef.current.isPlaying() || turnRef.current !== turnAtComplete) {
                 clearInterval(poll);
                 if (turnRef.current === turnAtComplete) {
+                  const timing = turnTimingRef.current;
+                  const done = { audioOut: audioCountRef.current } as Record<string, number>;
+                  if (timing?.firstAudioAt !== undefined) {
+                    const msTotal = Math.round(performance.now() - timing.tSubmit);
+                    console.info(`[voice] TURN cid=${timing.cid} submit->done=${msTotal}ms`);
+                    done.latTotalMs = msTotal;
+                  }
+                  setDiag((prev) => ({ ...prev, ...done }));
                   setMicState(streamerRef.current?.isCapturingAudio() ? 'listening' : 'idle');
                 }
               }
@@ -504,6 +550,19 @@ export const AIVoiceTesterModal: React.FC<Props> = ({
         streamerRef.current.stopRecording();
       }
       sendWs({ type: 'audio_end', cid });
+      turnTimingRef.current = { cid, tSubmit: performance.now(), kind: 'voice' };
+      try {
+        const mt = streamerRef.current?.getMicTimings();
+        if (mt && mt.recStart) {
+          console.info(
+            `[voice] VTIME cid=${cid} rec->first_frame=${Math.round(mt.firstFrame - mt.recStart)}ms ` +
+            `first_frame->first_sent=${Math.round(mt.firstFlush - mt.firstFrame)}ms ` +
+            `speech->end_signal=${Math.round(performance.now() - mt.recStart)}ms`
+          );
+        }
+      } catch {
+        // ignore — timing is best-effort
+      }
       setMicState('processing');
       armWatchdog(cid);
     } else {
@@ -574,6 +633,7 @@ export const AIVoiceTesterModal: React.FC<Props> = ({
     }
     console.info(`[voice] WS sent text cid=${cid}`);
     setInputText('');
+    turnTimingRef.current = { cid, tSubmit: performance.now(), kind: 'text' };
 
     setMessages((prev) => [
       ...prev,
@@ -706,6 +766,9 @@ export const AIVoiceTesterModal: React.FC<Props> = ({
           <span>turns: {diag.turns ?? 0}</span>
           <span>interrupts: {diag.interrupts ?? 0}</span>
           <span>tools: {diag.tools ?? 0}</span>
+          {diag.latAudioMs !== undefined && <span>1st audio: {diag.latAudioMs}ms</span>}
+          {diag.backendAudioMs !== undefined && <span>srv: {diag.backendAudioMs}ms</span>}
+          {diag.latTotalMs !== undefined && <span>total: {diag.latTotalMs}ms</span>}
         </div>
 
         {/* Live Conversation Thread */}

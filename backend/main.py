@@ -1,8 +1,10 @@
 import uuid
 import base64
+import os
+import urllib.parse
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from database import (
     init_db,
@@ -399,6 +401,7 @@ async def browser_voice_simulator_stream(websocket: WebSocket):
             elif msg_type == "audio_end":
                 if session.is_active:
                     _ws_log.info(f"WS audio_end cid={cid}.")
+                    session.mark_turn_received(cid, kind="voice")
                     await session.end_audio_stream()
 
             elif msg_type == "stop":
@@ -417,6 +420,76 @@ async def browser_voice_simulator_stream(websocket: WebSocket):
         # handler error, or explicit stop. Never on turn_complete.
         _ws_log.info(f"WS CLOSE caller={masked} stats={ws_stats} -> closing Gemini session.")
         await session.close(source="browser_ws_closed")
+
+# ----------------- Real Phone Calls (Twilio <-> Gemini Live) -----------------
+# Step 1-2 of the restaurant call flow: customer dials the Twilio number,
+# Twilio hits /api/voice/incoming, audio streams over /api/voice/twilio-stream.
+# Steps 3-5 reuse GeminiLiveSession (menu/tools/greeting) + call logging.
+
+def _twilio_stream_url(request: Request) -> str:
+    """Public wss:// URL Twilio should stream call audio to."""
+    override = os.getenv("TWILIO_STREAM_URL", "").strip()
+    if override:
+        return override
+    base = str(request.base_url)  # e.g. https://<ngrok>.ngrok.io/
+    scheme = "wss" if base.startswith("https") else "ws"
+    host = base.split("://", 1)[1].rstrip("/")
+    return f"{scheme}://{host}/api/voice/twilio-stream"
+
+
+@app.post("/api/voice/incoming")
+async def twilio_incoming_call(request: Request):
+    """Twilio webhook: a customer called. Answer with TwiML media stream."""
+    from services.telephony_bridge import generate_twilio_stream_twiml, mask_phone
+    # Parsed manually (no python-multipart dependency needed).
+    body = (await request.body()).decode("utf-8", errors="ignore")
+    params = urllib.parse.parse_qs(body)
+    first = lambda k, d="": params.get(k, [d])[0]
+    from_num = first("From", "Unknown")
+    call_sid = first("CallSid", "")
+    import logging as _logging
+    _logging.getLogger("voice_ws").info(
+        f"Incoming call caller={mask_phone(from_num)} call_sid={call_sid}"
+    )
+    twiml = generate_twilio_stream_twiml(
+        stream_url=_twilio_stream_url(request),
+        caller_phone=from_num,
+        call_sid=call_sid,
+    )
+    return Response(content=twiml, media_type="application/xml")
+
+
+@app.websocket("/api/voice/twilio-stream")
+async def twilio_media_stream(websocket: WebSocket):
+    """Twilio Media Stream socket: 8kHz mu-law <-> Gemini Live for one call."""
+    from services.telephony_bridge import TwilioCallBridge
+    import logging as _logging
+    _ws_log = _logging.getLogger("voice_ws")
+    await websocket.accept()
+
+    async def send_json(obj: dict):
+        try:
+            await websocket.send_json(obj)
+        except Exception:
+            pass
+
+    bridge = TwilioCallBridge(send_json=send_json)
+    try:
+        while True:
+            msg = await websocket.receive_json()
+            if not isinstance(msg, dict):
+                continue
+            result = await bridge.handle_message(msg)
+            if result == "stop":
+                break
+    except WebSocketDisconnect as e:
+        _ws_log.info(f"Twilio WS disconnect code={e.code} reason={e.reason!r}")
+    except Exception as e:
+        import traceback
+        _ws_log.error(f"Twilio WS error: {e}\n{traceback.format_exc()}")
+    finally:
+        await bridge.close(reason="ws_closed")
+
 
 # ----------------- Voice Tool Endpoints -----------------
 

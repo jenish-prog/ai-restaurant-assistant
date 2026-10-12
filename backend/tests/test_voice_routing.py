@@ -327,5 +327,88 @@ class TestMultiTurnKeepalive(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(s.is_active)
 
 
+class TestOrderingLatencyRefactor(unittest.TestCase):
+    def test_draft_totals_unchanged(self):
+        from services.ordering_service import (
+            create_or_update_order_draft, calculate_order_total, get_live_menu,
+        )
+        res = create_or_update_order_draft(
+            items=[{"name": "Chicken Biryani", "quantity": 2}],
+            order_type="Takeout",
+            customer_name="T", customer_phone="+910000000000",
+        )
+        if res.get("status") != "success":
+            self.skipTest(f"seed menu lacks Chicken Biryani: {res}")
+        total = calculate_order_total(res["draft_id"])
+        self.assertEqual(total["status"], "success")
+        # 5% GST + total math preserved exactly
+        self.assertAlmostEqual(total["grand_total"],
+                               round(total["subtotal"] * 1.05 + total["delivery_fee"], 2))
+        self.assertIn(f"₹{total['grand_total']:.0f}", res["read_back_prompt"])
+        self.assertNotIn("Subtotal", res["read_back_prompt"])
+
+    def test_menu_compact_but_accurate(self):
+        from services.ordering_service import get_live_menu
+        from database import get_all_menu_items
+        menu = get_live_menu()
+        self.assertEqual(menu["status"], "success")
+        db = {i["name"]: i for i in get_all_menu_items()}
+        for entry in menu["available_items"]:
+            self.assertLessEqual(len(entry["description"]), 80)
+            self.assertEqual(entry["price_inr"], db[entry["name"]]["price"])
+            self.assertTrue(db[entry["name"]]["is_available"])
+
+
+class TestTurnLatencyMarks(unittest.IsolatedAsyncioTestCase):
+    async def test_marks_ordered_and_reported(self):
+        s, fake, diags = make_session()
+        s.mark_turn_received("cturn", kind="text")
+        await s._handle_server_message(FakeResponse(FakeServerContent(out_tx="hi")))
+        marks = s._turn_marks["cturn"]
+        self.assertLessEqual(marks["t_recv"], marks["t_first_event"])
+        self.assertNotIn("t_first_audio", marks)
+        s.on_audio_out = lambda b: asyncio.sleep(0)
+        await s._handle_server_message(FakeResponse(
+            FakeServerContent(model_turn=FakeModelTurn([FakePart(audio=b"\x01\x02" * 10)]))))
+        marks = s._turn_marks["cturn"]
+        self.assertLessEqual(marks["t_first_event"], marks["t_first_audio"])
+        latency_diags = [d for d in diags if d["event"] == "turn_latency"]
+        self.assertEqual(len(latency_diags), 1)
+        self.assertEqual(latency_diags[0]["cid"], "cturn")
+        self.assertGreaterEqual(latency_diags[0]["ms_recv_to_audio"], 0)
+
+
+class TestVoiceInputMarks(unittest.IsolatedAsyncioTestCase):
+    async def test_first_byte_carried_into_voice_turn(self):
+        s, fake, _ = make_session()
+        s.note_voice_audio_rx()
+        self.assertIn("t_first", s._turn_marks["__voice_audio"])
+        s.mark_turn_received("v1", kind="voice")
+        self.assertEqual(s._turn_marks["v1"]["kind"], "voice")
+        self.assertIn("t_audio_first_rx", s._turn_marks["v1"])
+        self.assertNotIn("__voice_audio", s._turn_marks)
+        self.assertLessEqual(
+            s._turn_marks["v1"]["t_audio_first_rx"], s._turn_marks["v1"]["t_recv"])
+
+    async def test_partial_vs_final_transcription(self):
+        s, fake, diags = make_session()
+        s.on_transcript = lambda who, tx: asyncio.sleep(0)
+        s.mark_turn_received("v2", kind="voice")
+        await s._handle_server_message(FakeResponse(FakeServerContent(in_tx="two")))
+        await s._handle_server_message(FakeResponse(FakeServerContent(in_tx="two biryanis")))
+        m = s._turn_marks["v2"]
+        self.assertLessEqual(m["t_first_in_tx"], m["t_last_in_tx"])
+        await s._handle_server_message(FakeResponse(FakeServerContent(turn_complete=True)))
+        self.assertIsNone(s._active_cid)
+
+    async def test_hands_free_stream_without_cid(self):
+        s, fake, _ = make_session()
+        s.on_transcript = lambda who, tx: asyncio.sleep(0)
+        await s._handle_server_message(FakeResponse(FakeServerContent(in_tx="hello")))
+        self.assertIn("t_first_in_tx", s._turn_marks["__voice_stream"])
+        await s._handle_server_message(FakeResponse(FakeServerContent(turn_complete=True)))
+        self.assertNotIn("__voice_stream", s._turn_marks)
+
+
 if __name__ == "__main__":
     unittest.main()
