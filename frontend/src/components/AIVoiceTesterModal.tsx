@@ -92,6 +92,10 @@ export const AIVoiceTesterModal: React.FC<Props> = ({
     latAudioMs?: number;
     latTotalMs?: number;
     backendAudioMs?: number;
+    geminiTtfbMs?: number;
+    backendIngressMs?: number;
+    lastToolMs?: number;
+    lastToolName?: string;
   }>({});
   // One turn in flight at a time: cid traces submit→WS→backend→Gemini→reply.
   const pendingCidRef = useRef<string | null>(null);
@@ -162,7 +166,7 @@ export const AIVoiceTesterModal: React.FC<Props> = ({
   }, [isAudioMuted]);
 
   const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    messagesEndRef.current?.scrollIntoView({ behavior: 'auto' });
   };
 
   useEffect(() => {
@@ -235,7 +239,19 @@ export const AIVoiceTesterModal: React.FC<Props> = ({
             console.info(`[voice] diag: ${data.event}`, s);
           }
           if (data.event === 'turn_latency' && typeof data.ms_recv_to_audio === 'number') {
-            setDiag((prev) => ({ ...prev, backendAudioMs: data.ms_recv_to_audio }));
+            setDiag((prev) => ({
+              ...prev,
+              backendAudioMs: data.ms_recv_to_audio,
+              geminiTtfbMs: data.ms_gemini_ttfb ?? prev.geminiTtfbMs,
+              backendIngressMs: data.ms_recv_to_gemini ?? prev.backendIngressMs,
+            }));
+          }
+          if (data.event === 'tool_call') {
+            setDiag((prev) => ({
+              ...prev,
+              lastToolName: data.name,
+              lastToolMs: data.ms,
+            }));
           }
           if (
             data.event === 'session_error' ||
@@ -602,39 +618,18 @@ export const AIVoiceTesterModal: React.FC<Props> = ({
 
   // Send text turn (e.g. quick sample query or keyboard).
   // Lifecycle: submit log → safe WS send (cid) → backend ack → Gemini events
-  // → turn_complete clears processing. Failures surface as errors; the input
-  // clears only after the message is accepted for sending.
+  // Send text turn (e.g. quick sample query or keyboard).
+  // Immediately renders message in chat thread for zero-latency UI response,
+  // then streams via WebSocket to Gemini Live.
   const handleSendText = (textOverride?: string) => {
     const text = (textOverride || inputText).trim();
     if (!text) return;
 
     const cid = `txt-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
-    console.info(`[voice] submit text cid=${cid} (${text.length} chars)`);
-    if (!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-      console.error(`[voice] submit blocked cid=${cid}: socket not open`);
-      setErrorMessage('Cannot send message: WebSocket is disconnected. Press Reconnect.');
-      return;
-    }
-
     const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
-    // New turn so the coming AI answer starts a fresh bubble.
-    turnRef.current += 1;
-    try {
-      streamerRef.current?.resetPlaybackSchedule();
-    } catch {
-      // ignore
-    }
-
-    const accepted = sendWs({ type: 'text', text, cid });
-    if (!accepted) {
-      setErrorMessage('Cannot send message: WebSocket is disconnected. Press Reconnect.');
-      return;
-    }
-    console.info(`[voice] WS sent text cid=${cid}`);
+    // 1. Immediately display user message in chat and clear input field (0ms lag)
     setInputText('');
-    turnTimingRef.current = { cid, tSubmit: performance.now(), kind: 'text' };
-
     setMessages((prev) => [
       ...prev,
       {
@@ -644,6 +639,33 @@ export const AIVoiceTesterModal: React.FC<Props> = ({
         time: now,
       },
     ]);
+
+    console.info(`[voice] submit text cid=${cid} (${text.length} chars)`);
+    if (!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      console.error(`[voice] submit blocked cid=${cid}: socket not open`);
+      setErrorMessage('Cannot send message: WebSocket is disconnected. Press Reconnect.');
+      return;
+    }
+
+    // 2. Clear stale playback schedule and interrupt any remaining audio so new turn starts instantly
+    if (streamerRef.current?.isPlaying()) {
+      streamerRef.current.interrupt();
+    }
+    turnRef.current += 1;
+    try {
+      streamerRef.current?.resetPlaybackSchedule();
+    } catch {
+      // ignore
+    }
+
+    // 3. Immediately send text turn through WebSocket
+    turnTimingRef.current = { cid, tSubmit: performance.now(), kind: 'text' };
+    const accepted = sendWs({ type: 'text', text, cid });
+    if (!accepted) {
+      setErrorMessage('Cannot send message: WebSocket is disconnected. Press Reconnect.');
+      return;
+    }
+    console.info(`[voice] WS sent text cid=${cid}`);
 
     setMicState('processing');
     armWatchdog(cid);
@@ -757,17 +779,32 @@ export const AIVoiceTesterModal: React.FC<Props> = ({
           </div>
         )}
 
-        {/* Dev diagnostics: counters only, no audio content or secrets */}
-        <div className="bg-slate-900 text-slate-300 px-5 py-1.5 text-[10px] font-mono flex flex-wrap gap-x-3 gap-y-0.5 border-b border-slate-800">
-          <span>mic: {diag.chunksSent ?? 0} frames{diag.nativeRate ? ` @${diag.nativeRate}→16kHz` : ''}</span>
+        {/* Dev diagnostics: real-time latency & telemetry HUD */}
+        <div className="bg-slate-900 text-slate-300 px-5 py-1.5 text-[10px] font-mono flex flex-wrap gap-x-3 gap-y-0.5 border-b border-slate-800 items-center">
+          <span>mic: {diag.chunksSent ?? 0} frames{diag.nativeRate ? ` @${diag.nativeRate}→16kHz (20-40ms)` : ''}</span>
           <span>ai audio: {diag.audioOut ?? 0}</span>
-          <span>in-tx: {diag.inputTx ?? 0}</span>
-          <span>out-tx: {diag.outputTx ?? 0}</span>
           <span>turns: {diag.turns ?? 0}</span>
-          <span>interrupts: {diag.interrupts ?? 0}</span>
           <span>tools: {diag.tools ?? 0}</span>
-          {diag.latAudioMs !== undefined && <span>1st audio: {diag.latAudioMs}ms</span>}
-          {diag.backendAudioMs !== undefined && <span>srv: {diag.backendAudioMs}ms</span>}
+          {diag.latAudioMs !== undefined && (
+            <span className="text-emerald-400 font-bold bg-emerald-950/60 px-1.5 py-0.5 rounded border border-emerald-700/50">
+              1st audio: {diag.latAudioMs}ms
+            </span>
+          )}
+          {diag.geminiTtfbMs !== undefined && (
+            <span className="text-amber-300 font-medium">
+              gemini ttfb: {diag.geminiTtfbMs}ms
+            </span>
+          )}
+          {diag.backendAudioMs !== undefined && (
+            <span className="text-slate-400">
+              srv audio: {diag.backendAudioMs}ms
+            </span>
+          )}
+          {diag.lastToolMs !== undefined && (
+            <span className="text-cyan-300">
+              tool: {diag.lastToolMs}ms ({diag.lastToolName})
+            </span>
+          )}
           {diag.latTotalMs !== undefined && <span>total: {diag.latTotalMs}ms</span>}
         </div>
 

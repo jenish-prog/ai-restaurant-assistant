@@ -195,13 +195,12 @@ class GeminiLiveSession:
         self.transcript_history = []
         self.last_error = None
         self.greeting_sent = False
-        # Batch tiny 8ms mic packets into ~200ms frames before hitting the
-        # Gemini API: fewer requests = lower latency + cleaner transcription.
+        # Low-latency streaming: forward 20-40ms chunks continuously to Gemini Live
         self._audio_buffer = bytearray()
         self._audio_lock = asyncio.Lock()
-        self._flush_bytes = 6400  # 200ms @ 16kHz 16-bit mono
-        self._min_partial_bytes = 960  # 30ms — periodic flusher floor
-        self._flush_interval = 0.08  # 80ms tail flush
+        self._flush_bytes = 960  # ~30ms @ 16kHz 16-bit mono (was 6400 / 200ms)
+        self._min_partial_bytes = 640  # ~20ms flusher floor
+        self._flush_interval = 0.03  # 30ms tail flush (was 80ms)
         # Diagnostics counters (no audio content, no secrets).
         self.stats: Dict[str, int] = {
             "audio_frames_in": 0,
@@ -269,19 +268,23 @@ class GeminiLiveSession:
         if not marks:
             return
         now = _time.perf_counter()
+        t_sent = marks.get("t_gemini_sent", marks["t_recv"])
         if "t_first_event" not in marks:
             marks["t_first_event"] = now
             dt = (now - marks["t_recv"]) * 1000
-            logger.info(f"TURN cid={cid} kind={marks.get('kind')} recv->first_event={dt:.0f}ms")
+            ttfb = (now - t_sent) * 1000
+            logger.info(f"TURN cid={cid} kind={marks.get('kind')} recv->first_event={dt:.0f}ms (gemini_ttfb={ttfb:.0f}ms)")
         if is_audio and "t_first_audio" not in marks:
             marks["t_first_audio"] = now
             dt = (now - marks["t_recv"]) * 1000
+            ttfb = (now - t_sent) * 1000
             dev = (now - marks["t_first_event"]) * 1000 if "t_first_event" in marks else 0
-            logger.info(f"TURN cid={cid} kind={marks.get('kind')} recv->first_audio={dt:.0f}ms (event->audio={dev:.0f}ms)")
+            logger.info(f"TURN cid={cid} kind={marks.get('kind')} recv->first_audio={dt:.0f}ms (gemini_ttfb={ttfb:.0f}ms, event->audio={dev:.0f}ms)")
             await self._emit_diag("turn_latency", {
                 "cid": cid,
                 "kind": marks.get("kind"),
-                "ms_recv_to_event": round((marks["t_first_event"] - marks["t_recv"]) * 1000),
+                "ms_recv_to_gemini": round((t_sent - marks["t_recv"]) * 1000),
+                "ms_gemini_ttfb": round(ttfb),
                 "ms_recv_to_audio": round(dt),
             })
 
@@ -389,19 +392,24 @@ class GeminiLiveSession:
             return False
 
     async def send_audio_chunk(self, pcm16k_bytes: bytes):
-        """Buffers user microphone audio and flushes ~200ms frames to Gemini."""
+        """Buffers user microphone audio and flushes 20-40ms frames to Gemini with near-zero latency."""
         if not self.is_active or not self.session:
             return
 
         self.stats["audio_frames_in"] += 1
         self.stats["audio_bytes_in"] += len(pcm16k_bytes)
         self.note_voice_audio_rx()
+
         async with self._audio_lock:
-            self._audio_buffer.extend(pcm16k_bytes)
-            if len(self._audio_buffer) < self._flush_bytes:
-                return
-            frame = bytes(self._audio_buffer)
-            self._audio_buffer.clear()
+            # If buffer is empty and incoming chunk is >= 640 bytes (~20ms), forward immediately
+            if not self._audio_buffer and len(pcm16k_bytes) >= 640:
+                frame = pcm16k_bytes
+            else:
+                self._audio_buffer.extend(pcm16k_bytes)
+                if len(self._audio_buffer) < self._flush_bytes:
+                    return
+                frame = bytes(self._audio_buffer)
+                self._audio_buffer.clear()
 
         try:
             await self.session.send_realtime_input(
@@ -416,7 +424,7 @@ class GeminiLiveSession:
             logger.error(f"Error streaming audio to Gemini Live: {e}")
 
     async def _periodic_flush_loop(self):
-        """Flushes partial mic tails every 80ms so pauses don't truncate words.
+        """Flushes partial mic tails every 30ms so pauses don't truncate words.
 
         Without this, audio below _flush_bytes sits buffered while server VAD
         already fires → truncated transcription ("heard another question").
@@ -454,6 +462,7 @@ class GeminiLiveSession:
         """Flushes leftover mic audio, then notifies Gemini the turn ended."""
         if not self.is_active or not self.session:
             return
+        import time as _time
         try:
             remainder = await self._flush_audio_buffer()
             if remainder:
@@ -461,23 +470,30 @@ class GeminiLiveSession:
                     media=types.Blob(data=remainder, mime_type="audio/pcm;rate=16000")
                 )
             await self.session.send_realtime_input(audio_stream_end=True)
+            if self._active_cid and self._active_cid in self._turn_marks:
+                self._turn_marks[self._active_cid]["t_gemini_sent"] = _time.perf_counter()
+            logger.info("Sent audio_stream_end=True to Gemini Live.")
         except Exception as e:
             logger.error(f"Error ending audio stream to Gemini Live: {e}")
 
     async def send_text_prompt(self, text: str, cid: Optional[str] = None) -> bool:
-        """Sends a typed user turn via the supported text path.
+        """Sends a typed user turn via send_client_content with explicit turn_complete=True.
 
-        Uses send_client_content (not the deprecated session.send). Returns
-        True only if Gemini accepted it; failures emit a diag error so the
-        frontend never sits in PROCESSING forever. `cid` correlates logs.
+        Explicit turn_complete=True guarantees Gemini immediately finalizes the user turn
+        and generates the response without waiting for activity detection silence timeouts.
         """
         if not self.is_active or not self.session:
             await self._emit_diag("text_dropped", {"cid": cid, "reason": "session_inactive"})
             return False
         tag = f" cid={cid}" if cid else ""
-        logger.info(f"Gemini input: text turn ({len(text)} chars){tag}.")
+        logger.info(f"Gemini input: text turn ({len(text)} chars) with turn_complete=True{tag}.")
+        import time as _time
         try:
             self.mark_turn_received(cid, kind="text")
+            if cid and cid in self._turn_marks:
+                self._turn_marks[cid]["t_gemini_sent"] = _time.perf_counter()
+
+            # Explicit turn_complete=True forces immediate turn processing
             await self.session.send_client_content(
                 turns={"role": "user", "parts": [{"text": text}]},
                 turn_complete=True,
@@ -679,7 +695,30 @@ class GeminiLiveSession:
                     await self._emit_diag("tool_response_error", {"error": str(e)[:200]})
 
     async def _execute_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Executes server-side tool functions."""
+        """Executes server-side tool functions asynchronously in threadpool to prevent blocking the event loop."""
+        result = await asyncio.to_thread(self._execute_tool_sync, name, args)
+
+        # Trigger WhatsApp confirmation asynchronously on event loop upon success
+        if name in ("confirm_order", "confirm_and_place_order") and result.get("status") == "success" and result.get("order_id"):
+            self.current_draft_id = None
+            order_id = result["order_id"]
+            items_str = f"Order #{order_id} via Aura Dining AI Voice Assistant"
+            asyncio.create_task(
+                send_whatsapp_order_confirmation(
+                    to_phone=self.caller_phone,
+                    order_id=order_id,
+                    customer_name=self.caller_name,
+                    items_summary=items_str,
+                    total_amount=result.get("total_inr", 0.0),
+                    order_type=result.get("order_type", "Takeout"),
+                    estimated_time=result.get("estimated_time", "20-30 mins")
+                )
+            )
+
+        return result
+
+    def _execute_tool_sync(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Executes synchronous database and business logic operations."""
         if isinstance(args, str):
             try:
                 args = json.loads(args)
@@ -724,27 +763,6 @@ class GeminiLiveSession:
                 caller_confirmed=caller_confirmed,
                 call_id=self.call_id
             )
-
-            # Trigger WhatsApp confirmation asynchronously upon success
-            if result.get("status") == "success" and result.get("order_id"):
-                # Fresh draft for the NEXT order — otherwise the next
-                # "I want ..." reuses the already-confirmed draft and the AI
-                # repeats the old order instead of starting a new one.
-                self.current_draft_id = None
-                order_id = result["order_id"]
-                items_str = f"Order #{order_id} via Aura Dining AI Voice Assistant"
-                asyncio.create_task(
-                    send_whatsapp_order_confirmation(
-                        to_phone=self.caller_phone,
-                        order_id=order_id,
-                        customer_name=self.caller_name,
-                        items_summary=items_str,
-                        total_amount=result.get("total_inr", 0.0),
-                        order_type=result.get("order_type", "Takeout"),
-                        estimated_time=result.get("estimated_time", "20-30 mins")
-                    )
-                )
-
             return result
 
         elif name == "transfer_to_human":

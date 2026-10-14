@@ -46,14 +46,14 @@ export class AudioStreamer {
   private onSpeakingStateChange?: (speaking: boolean) => void;
   private onMicError?: (message: string) => void;
   private isCapturing: boolean = false;
-  // Batch tiny worklet packets into ~150-200ms frames: fewer WebSocket messages
-  // = less congestion, faster + more accurate transcription server-side.
+  // Batch audio into 20–40 ms frames (~640–1280 bytes at 16kHz 16-bit mono)
+  // per Google's Gemini Live low-latency streaming recommendation.
   private micQueue: Uint8Array[] = [];
   private micQueuedBytes: number = 0;
-  private micFlushBytes: number = 6400; // ~200ms @ 16kHz 16-bit mono
+  private micFlushBytes: number = 960; // ~30ms @ 16kHz 16-bit mono (30ms = 480 samples * 2 bytes)
   private micFlushTimer: number | null = null;
   private primed: boolean = false;
-  private primeBytes: number = 1600; // ~50ms: first byte out fast, then normal rules
+  private primeBytes: number = 640; // ~20ms: first byte out fast
   private nativeRate: number = MIC_TARGET_RATE;
   private chunksSent: number = 0;
   private bytesSent: number = 0;
@@ -185,11 +185,11 @@ export class AudioStreamer {
 
   private startMicFlushTimer(): void {
     this.stopMicFlushTimer();
-    // Time-based flush: ship partial tails every 100ms so pauses don't cut
-    // the last syllable (server VAD would fire on truncated audio).
+    // Time-based flush: ship partial tails every 30ms so pauses don't cut
+    // speech and Gemini receives low-latency streaming chunks continuously.
     this.micFlushTimer = window.setInterval(() => {
       if (this.isCapturing) this.flushMicQueue();
-    }, 100);
+    }, 30);
   }
 
   private stopMicFlushTimer(): void {
